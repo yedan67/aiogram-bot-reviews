@@ -1,0 +1,175 @@
+import asyncio
+import sqlite3
+import math
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+BOT_TOKEN = "вам токен бота сюда"
+SERVICES = ["@BlackVPN_OfficialBot"]
+#пример просто
+REVIEWS_PER_PAGE = 5
+DB_NAME = "reviews.db"
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+class ReviewStates(StatesGroup):
+    waiting_for_rating = State()
+    waiting_for_review_text = State()
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        service TEXT, user_id INTEGER, username TEXT,
+        rating INTEGER, review_text TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_service ON reviews(service)')
+    conn.commit()
+    conn.close()
+
+def add_review(service, user_id, username, rating, text):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('INSERT INTO reviews (service, user_id, username, rating, review_text) VALUES (?,?,?,?,?)',
+              (service, user_id, username, rating, text))
+    conn.commit()
+    conn.close()
+
+def get_reviews(service, page=1):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*) FROM reviews WHERE service=?', (service,))
+    total = c.fetchone()[0]
+    offset = (page - 1) * REVIEWS_PER_PAGE
+    c.execute('''SELECT username, rating, review_text, created_at FROM reviews 
+                 WHERE service=? ORDER BY created_at DESC LIMIT ? OFFSET ?''',
+              (service, REVIEWS_PER_PAGE, offset))
+    reviews = c.fetchall()
+    conn.close()
+    return reviews, total
+
+def get_avg(service):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT AVG(rating), COUNT(*) FROM reviews WHERE service=?', (service,))
+    avg, count = c.fetchone()
+    conn.close()
+    return (round(avg, 1) if avg else 0.0), count or 0
+
+def main_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton("📦 Сервисы", "services")],
+        [InlineKeyboardButton("✍️ Отзывы", "reviews")]
+    ])
+
+def services_kb():
+    kb = [[InlineKeyboardButton(s, f"view_{s}_1")] for s in SERVICES]
+    kb.append([InlineKeyboardButton("🔙 Назад", "back")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def pagination_kb(service, page, total_pages):
+    buttons = []
+    nav = []
+    if page > 1: nav.append(InlineKeyboardButton("⬅️", f"view_{service}_{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page}/{total_pages}", "ignore"))
+    if page < total_pages: nav.append(InlineKeyboardButton("➡️", f"view_{service}_{page+1}"))
+    if nav: buttons.append(nav)
+    buttons.append([InlineKeyboardButton("✍️ Отзыв", f"review_{service}"), InlineKeyboardButton("🔙 Назад", "reviews")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def rating_kb():
+    kb = [[InlineKeyboardButton(str(i), f"rate_{i}") for i in range(6)]]
+    kb.append([InlineKeyboardButton("🔙 Назад", "back")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+@dp.message(Command("start"))
+async def start(m: types.Message):
+    await m.answer("👋 Выберите действие:", reply_markup=main_menu())
+
+@dp.callback_query()
+async def cb(c: types.CallbackQuery, state: FSMContext):
+    data = c.data
+    if data == "ignore":
+        await c.answer()
+        return
+    if data == "back":
+        await state.clear()
+        await c.message.edit_text("👋 Главное меню:", reply_markup=main_menu())
+        await c.answer()
+        return
+    if data == "services":
+        await c.message.edit_text("📦 Сервисы:", reply_markup=services_kb())
+        await c.answer()
+        return
+    if data == "reviews":
+        kb = [[InlineKeyboardButton(f"{s} ({get_avg(s)[1]})", f"view_{s}_1")] for s in SERVICES]
+        kb.append([InlineKeyboardButton("🔙 Назад", "back")])
+        await c.message.edit_text("✍️ Выберите сервис:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        await c.answer()
+        return
+    if data.startswith("view_"):
+        parts = data.split("_")
+        service = "_".join(parts[1:-1])
+        page = int(parts[-1])
+        reviews, total = get_reviews(service, page)
+        total_pages = max(1, math.ceil(total / REVIEWS_PER_PAGE))
+        if total == 0:
+            text = f"📝 Отзывов для {service} нет"
+            kb = [[InlineKeyboardButton("✍️ Оставить", f"review_{service}")], [InlineKeyboardButton("🔙 Назад", "reviews")]]
+        else:
+            avg, count = get_avg(service)
+            text = f"📝 {service}\n\n"
+            for i, (username, rating, text_review, created) in enumerate(reviews, 1):
+                stars = "⭐" * rating + "☆" * (5 - rating)
+                date = datetime.strptime(created, '%Y-%m-%d %H:%M:%S').strftime('%d.%m.%Y')
+                text += f"{i}. @{username or 'Аноним'} {stars} ({rating}/5)\n{text_review}\n📅 {date}\n\n"
+            text += f"⭐ {avg:.1f}/5 | 📊 {count} отзывов | 📄 {page}/{total_pages}"
+            kb = pagination_kb(service, page, total_pages)
+        await c.message.edit_text(text, reply_markup=kb)
+        await c.answer()
+        return
+    if data.startswith("review_"):
+        service = data.replace("review_", "")
+        await state.update_data(service=service)
+        await state.set_state(ReviewStates.waiting_for_rating)
+        await c.message.edit_text(f"✍️ {service}\nОцените 0-5:", reply_markup=rating_kb())
+        await c.answer()
+        return
+    if data.startswith("rate_"):
+        rating = int(data.split("_")[1])
+        await state.update_data(rating=rating)
+        await state.set_state(ReviewStates.waiting_for_review_text)
+        await c.message.edit_text(f"⭐ {rating}/5\n✏️ Напишите отзыв:")
+        await c.answer()
+        return
+
+@dp.message(ReviewStates.waiting_for_review_text)
+async def process_review(m: types.Message, state: FSMContext):
+    data = await state.get_data()
+    service, rating = data.get('service'), data.get('rating')
+    if not service or rating is None:
+        await m.answer("❌ Ошибка. /start")
+        await state.clear()
+        return
+    add_review(service, m.from_user.id, m.from_user.username or m.from_user.first_name, rating, m.text)
+    avg, count = get_avg(service)
+    await m.answer(f"✅ Спасибо!\n{service}\n⭐ {rating}/5\n📈 {avg:.1f}/5 | 📊 {count} отзывов", reply_markup=main_menu())
+    await state.clear()
+
+@dp.message()
+async def other(m: types.Message):
+    await m.answer("❓ /start", reply_markup=main_menu())
+
+async def main():
+    init_db()
+    print("🚀 Бот запущен")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
